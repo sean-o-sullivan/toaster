@@ -1,0 +1,22 @@
+# Public repository allowlist. Local project memory and assets stay private.
+/*
+!/.gitignore
+!/src/
+!/include/
+!/test/
+!/tools/
+!/platformio.ini
+!/partitions.csv
+
+/tools/*
+!/tools/capture_study.py
+
+**/__pycache__/
+*.py[cod]
+.DS_Store
+*.csv
+*.log
+*.md
+*.mp4
+*.rgb565
+!/partitions.csv
