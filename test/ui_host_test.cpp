@@ -9,9 +9,17 @@
 #include "touch_ft6336.h"
 
 uint32_t host_millis = 0;
+int host_backlight_level = 1;
+uint8_t host_ledc_channel = 0;
+uint8_t host_ledc_pin = 0;
+uint32_t host_ledc_frequency = 0;
+uint8_t host_ledc_resolution = 0;
+uint32_t host_ledc_duty = 0;
 uint16_t host_pixels[240 * 320] = {};
 bool Ft6336Touch::begin() { return true; }
-bool Ft6336Touch::read(TouchPoint&) { return false; }
+bool host_touch_down = false;
+TouchPoint host_touch_point = {};
+bool Ft6336Touch::read(TouchPoint& point) { point = host_touch_point; return host_touch_down; }
 
 // A one-byte stand-in skips animation; boot video has separate asset validation.
 asm(".globl _binary_assets_boot_history_hot_240x135_12_5fps_rgb565_start\n"
@@ -73,7 +81,12 @@ void capture(const char* directory, const char* name) {
 int main(int argc, char** argv) {
   assert(argc == 2);
   OvenUi ui;
-  assert(ui.begin());
+  assert(ui.begin(1));
+  assert(ui.brightnessPercent() == 5);
+  assert(host_ledc_channel == 7 && host_ledc_pin == 45);
+  assert(host_ledc_frequency == 5000 && host_ledc_resolution == 8);
+  assert(host_ledc_duty == 5U * 255U / 100U);
+  assert(!ui.consumeBrightnessChange());
   EngineSnapshot snapshot;
   snapshot.probe_healthy = true;
   snapshot.process_celsius = 25.0F;
@@ -84,12 +97,14 @@ int main(int argc, char** argv) {
   capture(argv[1], "heater-tests");
   const UiCommand commands[] = {UiCommand::ChooseCommission100, UiCommand::ChooseCommission150,
                                  UiCommand::ChooseCommission200};
+  unsigned command_index = 0;
   for (auto command : commands) {
     ui.queue(command);
     assert(ui.consumeCommand() == UiCommand::None);
-    assert(ui.confirm_start_allowed_);
+    assert(ui.confirm_start_allowed_ == (command_index++ == 0));
     capture(argv[1], "test-review");
   }
+  ui.showConfirm(RecipeId::Commission100);
   snapshot.process_celsius = 61.0F;
   ui.update(snapshot);
   assert(!ui.confirm_start_allowed_);
@@ -147,7 +162,7 @@ int main(int argc, char** argv) {
   ui.queue(UiCommand::ShowStudy);
   assert(ui.consumeCommand() == UiCommand::None);
   capture(argv[1], "pid-study-locked");
-  ui.queue(UiCommand::ChooseValidateB);
+  ui.queue(UiCommand::ChooseCheck150);
   assert(ui.consumeCommand() == UiCommand::None);
   assert(!ui.confirm_start_allowed_);
   capture(argv[1], "pid-no-candidate");
@@ -161,8 +176,16 @@ int main(int argc, char** argv) {
   capture(argv[1], "pid-study-ready");
   ui.showStudyResults();
   capture(argv[1], "pid-results-empty");
-  for (auto& point : study.points) {
+  study.approved_checks_mask = kAllControlChecksMask;
+  study.required_checks_mask = kAllControlChecksMask;
+  study.checked_scope_mask = 0;
+  study.setup_revision = 3;
+  study.checked_setup_revision = 0;
+  study.candidate_revision = 4;
+  for (auto& point : study.checks) {
     point.result = StudyResult::Complete;
+    point.setup_revision = study.setup_revision;
+    point.candidate_revision = study.candidate_revision;
     point.attempts = 2;
     point.peak_celsius = 103.25F;
     point.rise_seconds = 220;
@@ -188,11 +211,13 @@ int main(int argc, char** argv) {
   capture(argv[1], "pid-save-failed");
   study.save_failed = false;
   study.saved = true;
+  study.checked_scope_mask = kAllControlChecksMask;
+  study.checked_setup_revision = study.setup_revision;
   ui.update(snapshot, study);
   capture(argv[1], "pid-saved");
   ui.showStudy();
   capture(argv[1], "pid-study-saved");
-  for (auto& point : study.points) {
+  for (auto& point : study.checks) {
     point.result = StudyResult::Aborted;
     point.attempts = 99;
     point.peak_celsius = 119.75F;
@@ -202,14 +227,36 @@ int main(int argc, char** argv) {
   ui.update(snapshot, study);
   ui.showStudyResults();
   capture(argv[1], "pid-results-stopped");
-  ui.showConfirm(RecipeId::ValidateC);
+  ui.showConfirm(RecipeId::Check200);
   assert(ui.confirm_start_allowed_);
   snapshot.process_celsius = 61;
   ui.update(snapshot, study);
   assert(!ui.confirm_start_allowed_);
   capture(argv[1], "pid-validation-hot");
   snapshot.state = EngineState::Fault;
-  for (auto fault : {FaultCode::TuneUnstable, FaultCode::NoTuneCandidate}) {
+  snapshot.recipe = &recipeFor(RecipeId::Autotune100);
+  study.tune_report.available = true;
+  study.tune_report.terminal = true;
+  auto& diagnostic = study.tune_report.latest;
+  diagnostic.cycle = 9;
+  diagnostic.failed_checks = TuneFractionLow | TuneMidpointSpread;
+  diagnostic.period = 106;
+  diagnostic.fraction = 0.25F;
+  diagnostic.amplitude = 5;
+  diagnostic.midpoint = 100;
+  diagnostic.period_ratio = 1.1F;
+  diagnostic.amplitude_ratio = 1.1F;
+  diagnostic.midpoint_span = 1.25F;
+  diagnostic.window_count = 3;
+  for (uint8_t i = 0; i < 3; ++i) {
+    diagnostic.window[i].cycle = 7 + i;
+    diagnostic.window[i].period = 104 + i;
+    diagnostic.window[i].fraction = 0.24F + 0.01F * i;
+    diagnostic.window[i].amplitude = 5;
+    diagnostic.window[i].midpoint = 99.5F + 0.625F * i;
+  }
+  for (auto fault : {FaultCode::TuneUnstable, FaultCode::NoTuneCandidate,
+                     FaultCode::InvalidRecipe, FaultCode::CheckNotApproved}) {
     snapshot.fault = fault;
     ui.update(snapshot, study);
     capture(argv[1], toString(fault));
