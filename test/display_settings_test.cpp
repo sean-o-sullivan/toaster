@@ -33,7 +33,7 @@ int main() {
   assert(loadDisplayBrightness(storage) == 100 && storage.ended);
   for (unsigned v = 0; v <= 255; ++v) {
     storage.value = static_cast<uint8_t>(v); storage.present = true;
-    assert(loadDisplayBrightness(storage) == (v >= 5 && v <= 100 ? v : 100));
+    assert(loadDisplayBrightness(storage) == (v >= 1 && v <= 100 ? v : 100));
   }
   assert(saveDisplayBrightness(storage, 37));
   assert(loadDisplayBrightness(storage) == 37 && storage.write_count == 1);

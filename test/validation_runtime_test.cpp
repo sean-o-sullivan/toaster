@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdio>
+#include <algorithm>
 
 #define private public
 #include "validation_runtime.h"
@@ -15,7 +16,87 @@ static ThermocoupleReading probe(uint32_t now, float temp = 25.0F) {
   return r;
 }
 
+static void testExperimentalTrial() {
+  ThermalEngine engine;
+  ValidationRuntime runtime;
+  PidGains gains;
+  gains.kp = 4.4263F;
+  gains.ki = 0.020742F;
+  gains.kd = 68.151F;
+  assert(engine.loadPid(gains, kAllControlChecksMask, 1U));
+  assert(engine.start(RecipeId::LeadedReflow, 1000U, probe(1000U)));
+  runtime.start(engine, 1000U);
+  uint32_t now = 1100U;
+  // Synthetic tracking exercises lifecycle only, not physical reflow performance.
+  for (; now < 1801000U; now += 100U) {
+    const auto& s = engine.snapshot();
+    const float process = s.state == EngineState::Cooling
+        ? s.process_celsius - 0.1F : std::max(25.0F, s.target_celsius - 3.0F);
+    engine.update(now, probe(now, process));
+    runtime.update(engine, now);
+    assert(engine.snapshot().output_percent <= 50.0F);
+    assert(engine.study().checked_scope_mask == kAllControlChecksMask);
+    assert(engine.runGains().kp == gains.kp && engine.runGains().ki == gains.ki &&
+           engine.runGains().kd == gains.kd);
+    if (engine.snapshot().state == EngineState::Cooling ||
+        engine.snapshot().state == EngineState::Complete) {
+      assert(!engine.heaterCommand() && engine.snapshot().output_percent == 0.0F);
+    }
+    if (engine.snapshot().state == EngineState::Complete) break;
+    assert(engine.snapshot().state != EngineState::Fault);
+  }
+  assert(engine.snapshot().state == EngineState::Complete);
+  const auto& view = runtime.views()[0];
+  assert(view.report.status == ValidationStatus::CriteriaMissing);
+  assert(view.report.metrics.peak_measured && view.report.metrics.peak_celsius == 202.0F);
+  assert(view.report.liquidus.measured && view.report.liquidus.value > 20.0F);
+  assert(view.report.liquidus.status == ValidationStatus::CriteriaMissing);
+  assert(view.report.metrics.liquidus_accumulated_ms ==
+         engine.snapshot().liquidus_elapsed_seconds * 1000U);
+  assert(view.consecutive_passes == 0 && !view.eligible && !view.commissioned);
+  assert(runtime.terminalPending());
+  engine.acknowledge();
+  assert(!runtime.commission(0, engine));
+  assert(!engine.start(RecipeId::Sac305Reflow, now + 100U, probe(now + 100U)));
+  assert(engine.snapshot().fault == FaultCode::HighTemperatureProfileNotCommissioned);
+
+  SavedValidationReport stored{};
+  stored.report = view.report;
+  stored.checksum = validationChecksum(stored);
+  assert(validSavedValidation(stored));
+  ValidationRuntime rebooted;
+  rebooted.loadHistorical(0, stored.report);
+  assert(rebooted.views()[0].report.liquidus.measured);
+  assert(rebooted.views()[0].report.liquidus.value == view.report.liquidus.value);
+  assert(!rebooted.views()[0].eligible && !rebooted.views()[0].commissioned);
+}
+
+static uint32_t identityFor(const Recipe& recipe) {
+  ThermalEngine engine;
+  ValidationRuntime runtime;
+  assert(engine.start(RecipeId::LeadedReflow, 1000U, probe(1000U)));
+  engine.snapshot_.recipe = &recipe;
+  runtime.start(engine, 1000U);
+  return runtime.views()[0].report.identity.recipe_revision;
+}
+
+static void testSafetyConfigurationIdentity() {
+  const Recipe original = recipeFor(RecipeId::LeadedReflow);
+  const uint32_t identity = identityFor(original);
+  Recipe changed = original;
+  changed.maximum_output_percent = 100.0F;
+  assert(identityFor(changed) != identity);
+  changed = original;
+  changed.maximum_process_celsius += 1.0F;
+  assert(identityFor(changed) != identity);
+  changed = original;
+  changed.maximum_run_seconds += 1U;
+  assert(identityFor(changed) != identity);
+}
+
 int main() {
+  testExperimentalTrial();
+  testSafetyConfigurationIdentity();
   ThermalEngine engine;
   ValidationRuntime runtime;
   assert(runtime.views()[0].report.status == ValidationStatus::CriteriaMissing);
@@ -61,6 +142,7 @@ int main() {
   runtime.update(engine, 3600);
   assert(!runtime.active_run_);
   assert(runtime.views()[0].report.status == ValidationStatus::Incomplete);
+  assert(!runtime.views()[0].report.liquidus.measured);
   assert(runtime.views()[0].consecutive_passes == 0);
   assert(runtime.terminalPending());
 

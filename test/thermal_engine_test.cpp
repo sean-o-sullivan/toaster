@@ -190,6 +190,177 @@ void testRecipeAndApprovalGuards() {
   assert(engine.start(RecipeId::Commission150, 0, healthy(25.0F, 0)));
   assert(!engine.configureControlChecks(kControlCheck100Mask, kAllControlChecksMask, 7));
   engine.abort();
+  engine.acknowledge();
+  assert(!engine.start(RecipeId::Check150, 0, healthy(25.0F, 0)));
+  assert(engine.snapshot().fault == FaultCode::NoTuneCandidate);
+  assertOff(engine);
+  engine.acknowledge();
+  for (RecipeId id : {RecipeId::Commission200, RecipeId::Check200}) {
+    assert(!engine.start(id, 0, healthy(25.0F, 0)));
+    assert(engine.snapshot().fault == FaultCode::CheckNotApproved);
+    assertOff(engine);
+    engine.acknowledge();
+  }
+}
+
+void testControlCheckOutputCaps() {
+  const auto& trial = recipeFor(RecipeId::LeadedReflow);
+  assert(trial.maximum_output_percent == 50.0F);
+  assert(trial.maximum_process_celsius == 220.0F);
+  assert(trial.maximum_run_seconds == 1800U);
+  assert(recipeHeatingDeadlineSeconds(trial) == 1800U);
+  assert(trial.liquidus_celsius == 183.0F);
+  assert(trial.phase_count == 5U);
+  assert(trial.phases[0].target_celsius == 150.0F);
+  assert(trial.phases[0].rate_celsius_per_second == 1.0F);
+  assert(trial.phases[1].duration_seconds == 60U);
+  assert(trial.phases[2].target_celsius == 205.0F);
+  assert(trial.phases[2].rate_celsius_per_second == 1.2F);
+  assert(trial.phases[3].duration_seconds == 20U);
+  assert(trial.phases[4].kind == PhaseKind::Cooldown);
+  assert(trial.phases[4].target_celsius == 60.0F);
+  for (RecipeId id : {RecipeId::Autotune100, RecipeId::Commission100,
+                     RecipeId::Commission150, RecipeId::Commission200}) {
+    assert(recipeFor(id).maximum_output_percent == 25.0F);
+  }
+  PidGains gains;
+  gains.kp = 4.4263F;
+  gains.ki = 0.020742F;
+  gains.kd = 68.151F;
+  for (RecipeId id : {RecipeId::Check100, RecipeId::Check150, RecipeId::Check200,
+                      RecipeId::LeadedReflow}) {
+    const float cap = (id == RecipeId::Check200 || id == RecipeId::LeadedReflow) ? 50.0F : 25.0F;
+    assert(recipeFor(id).maximum_output_percent == cap);
+    for (unsigned ending = 0; ending < 4; ++ending) {
+      ThermalEngine engine;
+      assert(engine.configureControlChecks(kControlCheck100Mask, kAllControlChecksMask, 1U));
+      assert(engine.loadPid(gains, kControlCheck100Mask | kControlCheck150Mask, 1U));
+      assert(engine.start(id, 0U, healthy(25.0F, 0U)));
+      engine.update(200000U, healthy(25.0F, 200000U));
+      assert(engine.snapshot().output_percent == cap);
+      assert(engine.heaterCommand());
+      assert(engine.runGains().kp == gains.kp);
+      assert(engine.runGains().ki == gains.ki);
+      assert(engine.runGains().kd == gains.kd);
+      assert(engine.study().checked_scope_mask ==
+          (kControlCheck100Mask | kControlCheck150Mask));
+      const uint32_t pulse_end_ms = 200000U + static_cast<uint32_t>(cap * 50.0F);
+      engine.update(pulse_end_ms - 1U, healthy(25.0F, pulse_end_ms - 1U));
+      assert(engine.snapshot().output_percent == cap && engine.heaterCommand());
+      engine.update(pulse_end_ms, healthy(25.0F, pulse_end_ms));
+      assert(engine.snapshot().output_percent == cap && !engine.heaterCommand());
+      engine.update(205000U, healthy(25.0F, 205000U));
+      assert(engine.snapshot().output_percent == cap && engine.heaterCommand());
+      if (ending == 0) {
+        engine.abort();
+        assert(engine.snapshot().state == EngineState::Aborted);
+      } else if (ending == 1) {
+        auto bad = healthy(25.0F, 205100U);
+        bad.fault = ThermocoupleFault::OpenCircuit;
+        engine.update(205100U, bad);
+        assert(engine.snapshot().fault == FaultCode::ProcessProbe);
+      } else if (ending == 2) {
+        engine.update(206001U, healthy(25.0F, 205000U));
+        assert(engine.snapshot().fault == FaultCode::ProcessProbe);
+      } else {
+        engine.update(205100U, healthy(recipeFor(id).maximum_process_celsius + 0.25F, 205100U));
+        assert(engine.snapshot().fault == FaultCode::ProcessOverTemperature);
+      }
+      assertOff(engine);
+    }
+  }
+}
+
+void startCheckCooling(ThermalEngine& engine, RecipeId id, uint32_t start_ms) {
+  const float target = controlCheckTargetCelsius(controlCheckIndex(id));
+  assert(engine.configureControlChecks(kControlCheck100Mask, kAllControlChecksMask, 1U));
+  assert(engine.loadPid(PidGains{}, kControlCheck100Mask, 1U));
+  assert(engine.start(id, start_ms, healthy(25.0F, start_ms)));
+  engine.update(start_ms + 400000U, healthy(target, start_ms + 400000U));
+  assert(engine.snapshot().phase_index == 1U);
+  engine.update(start_ms + 400100U, healthy(target, start_ms + 400100U));
+  engine.update(start_ms + 700100U, healthy(target, start_ms + 700100U));
+  assert(engine.snapshot().state == EngineState::Cooling);
+  assertOff(engine);
+}
+
+void testCheckCooldownAllowance(RecipeId id, uint32_t start_ms) {
+  const Recipe& recipe = recipeFor(id);
+  const int index = controlCheckIndex(id);
+  const float target = controlCheckTargetCelsius(index);
+  const uint32_t total_ms = recipe.maximum_run_seconds * 1000U;
+  assert(recipe.maximum_run_seconds == (id == RecipeId::Check150 ? 1500U : 1800U));
+  assert(recipeHeatingDeadlineSeconds(recipe) == 1200U);
+  assert(recipe.maximum_process_celsius == target + 20.0F);
+  assert(recipe.maximum_output_percent == (id == RecipeId::Check200 ? 50.0F : 25.0F));
+  for (RecipeId id : {RecipeId::Check100,
+                     RecipeId::Commission100, RecipeId::Commission150, RecipeId::Commission200}) {
+    assert(recipeFor(id).maximum_run_seconds == 1200U);
+    assert(recipeHeatingDeadlineSeconds(recipeFor(id)) == 1200U);
+  }
+
+  // Heating cannot consume the extra cooling-only allowance.
+  for (bool stalled_hold : {false, true}) {
+    ThermalEngine engine;
+    assert(engine.configureControlChecks(kControlCheck100Mask, kAllControlChecksMask, 1U));
+    assert(engine.loadPid(PidGains{}, kControlCheck100Mask, 1U));
+    assert(engine.start(id, start_ms, healthy(25.0F, start_ms)));
+    if (stalled_hold) {
+      engine.update(start_ms + 400000U, healthy(target, start_ms + 400000U));
+      assert(engine.snapshot().phase_index == 1U);
+    }
+    const float temperature = stalled_hold ? target - 5.0F : 25.0F;
+    engine.update(start_ms + 1199999U, healthy(temperature, start_ms + 1199999U));
+    assert(engine.snapshot().state == EngineState::Running);
+    assert(!engine.start(id, start_ms + 1199999U,
+        healthy(temperature, start_ms + 1199999U)));
+    engine.update(start_ms + 1200000U, healthy(temperature, start_ms + 1200000U));
+    assert(engine.snapshot().fault == FaultCode::RunTimeout);
+    assert(engine.study().checks[index].result == StudyResult::Failed);
+    assertOff(engine);
+  }
+
+  for (unsigned ending = 0; ending < 6; ++ending) {
+    ThermalEngine engine;
+    startCheckCooling(engine, id, start_ms);
+    engine.update(start_ms + 1200000U, healthy(66.75F, start_ms + 1200000U));
+    assert(engine.snapshot().state == EngineState::Cooling);
+    assert(engine.study().checks[index].result == StudyResult::Running);
+    assertOff(engine);
+    if (ending == 0) {
+      const uint32_t completed_ms = id == RecipeId::Check150 ? 1286000U : 1650000U;
+      engine.update(start_ms + completed_ms, healthy(60.0F, start_ms + completed_ms));
+      assert(engine.snapshot().state == EngineState::Complete);
+      assert(engine.study().checks[index].result == StudyResult::Complete);
+    } else if (ending == 1) {
+      engine.update(start_ms + total_ms - 1U, healthy(60.25F, start_ms + total_ms - 1U));
+      assert(engine.snapshot().state == EngineState::Cooling);
+      assertOff(engine);
+      assert(!engine.start(id, start_ms + total_ms - 1U,
+          healthy(60.25F, start_ms + total_ms - 1U)));
+      engine.update(start_ms + total_ms, healthy(60.0F, start_ms + total_ms));
+      assert(engine.snapshot().fault == FaultCode::RunTimeout);
+      assert(engine.study().checks[index].result == StudyResult::Failed);
+      engine.update(start_ms + total_ms + 1U, healthy(50.0F, start_ms + total_ms + 1U));
+      assert(engine.snapshot().state == EngineState::Fault);
+    } else if (ending == 2) {
+      auto bad = healthy(65.0F, start_ms + 1200100U);
+      bad.fault = ThermocoupleFault::OpenCircuit;
+      engine.update(start_ms + 1200100U, bad);
+      assert(engine.snapshot().fault == FaultCode::ProcessProbe);
+    } else if (ending == 3) {
+      engine.update(start_ms + 1200100U, healthy(recipe.maximum_process_celsius + 0.25F, start_ms + 1200100U));
+      assert(engine.snapshot().fault == FaultCode::ProcessOverTemperature);
+    } else if (ending == 4) {
+      engine.abort();
+      assert(engine.snapshot().state == EngineState::Aborted);
+      assert(engine.study().checks[index].result == StudyResult::Aborted);
+    } else {
+      engine.update(start_ms + 1201001U, healthy(65.0F, start_ms + 1200000U));
+      assert(engine.snapshot().fault == FaultCode::ProcessProbe);
+    }
+    assertOff(engine);
+  }
 }
 
 void testAnnealProgramValidation() {
@@ -352,6 +523,50 @@ void testAnnealControlledCooling() {
 }  // namespace
 
 int main() {
+  assert(recipeFor(RecipeId::Autotune100).maximum_run_seconds == 1800U);
+  testDeadline(RecipeId::Autotune100, 1000U);
+  testDeadline(RecipeId::Autotune100, UINT32_MAX - 10000U);
+  {
+    ThermalEngine recovery;
+    assert(!recovery.recoverTuneCandidate());
+    TuneRunReport report;
+    report.available = report.terminal = true;
+    report.outcome = TuneOutcome::Timeout;
+    report.cycles = 9;
+    report.latest.window_count = 3;
+    for (unsigned i = 0; i < 3; ++i) {
+      auto& c = report.latest.window[i];
+      c.cycle = 7 + i;
+      c.period = 94.0F;
+      c.heat_seconds = 27.4F;
+      c.fraction = c.heat_seconds / c.period;
+      c.minimum = 99.25F;
+      c.maximum = 101.75F;
+      c.amplitude = 1.25F;
+      c.midpoint = 100.5F;
+      c.failed_checks = TuneAmplitudeLow | TuneFractionLow;
+    }
+    assert(recovery.loadTuneReport(report));
+    const PidGains active = recovery.study().active;
+    assert(recovery.recoverTuneCandidate());
+    assert(recovery.study().candidate_ready);
+    assert(!recovery.canSaveStudy());
+    assert(recovery.study().active.kp == active.kp);
+    assert(recovery.study().tune_report.outcome == TuneOutcome::Timeout);
+    assertOff(recovery);
+    assert(!recovery.recoverTuneCandidate());
+    assert(recovery.start(RecipeId::Check100, 0, healthy(25, 0)));
+    assert(recovery.runGains().kp == recovery.study().candidate.kp);
+    assert(!recovery.recoverTuneCandidate());
+    ThermalEngine rejected;
+    report.outcome = TuneOutcome::OtherFault;
+    assert(rejected.loadTuneReport(report));
+    assert(!rejected.recoverTuneCandidate());
+    report.outcome = TuneOutcome::Timeout;
+    report.latest.window[0].maximum = report.latest.window[0].minimum;
+    assert(rejected.loadTuneReport(report));
+    assert(!rejected.recoverTuneCandidate());
+  }
   for (RecipeId id : {RecipeId::LeadedReflow, RecipeId::Nylon6Anneal, RecipeId::ChamberHold,
                      RecipeId::Commission100, RecipeId::Commission150, RecipeId::Commission200}) {
     testDeadline(id, 1000U);
@@ -362,6 +577,11 @@ int main() {
   }
   testInvalidDataAndLongHold();
   testRecipeAndApprovalGuards();
+  testControlCheckOutputCaps();
+  for (RecipeId id : {RecipeId::Check150, RecipeId::Check200}) {
+    testCheckCooldownAllowance(id, 1000U);
+    testCheckCooldownAllowance(id, UINT32_MAX - 10000U);
+  }
   testAnnealProgramValidation();
   testAnnealStartGuardsAndFrozenRecipe();
   testAnnealFaultsAndTimeout();

@@ -178,14 +178,31 @@ int main(int argc, char** argv) {
   ui.setElectronicsTemperatures(26.0F, 41.0F);
   assert(findLabelContaining(lv_scr_act(), "MAX 26°C / CPU 41°C"));
   capture(out, "01-home");
-  // Proposed home trend treatment: synthetic render fixtures, not live telemetry.
-  lv_label_set_text(ui.health_, LV_SYMBOL_UP " 2.4°C/min");
+  // Exercise the live estimator through UI updates, not substituted label text.
+  assert(std::strcmp(lv_label_get_text(ui.health_), "MEASURING TREND") == 0);
+  const auto feed_trend = [&](float rate) {
+    ui.temperature_trend_.reset();
+    for (unsigned i = 0; i <= 100; ++i) {
+      s.process_celsius = 25.0F + rate * (static_cast<float>(i) / 600.0F);
+      if (i) advance(ui, 100);
+      ui.update(s, study);
+    }
+  };
+  feed_trend(2.4F);
+  assert(std::strcmp(lv_label_get_text(ui.health_), LV_SYMBOL_UP " 2.4°C/min") == 0);
   capture(out, "01-home-trend-rising");
-  lv_label_set_text(ui.health_, LV_SYMBOL_DOWN " 0.8°C/min");
+  feed_trend(-0.8F);
+  assert(std::strcmp(lv_label_get_text(ui.health_), LV_SYMBOL_DOWN " 0.8°C/min") == 0);
   capture(out, "01-home-trend-falling");
-  lv_label_set_text(ui.health_, "STABLE");
+  feed_trend(0.0F);
+  assert(std::strcmp(lv_label_get_text(ui.health_), "STABLE") == 0);
   capture(out, "01-home-trend-stable");
-  ui.refreshDynamic(s);
+  s.probe_healthy = false; ui.update(s, study);
+  assert(std::strcmp(lv_label_get_text(ui.health_), "CHECK PROBE") == 0);
+  s.probe_healthy = true; ui.update(s, study);
+  assert(std::strcmp(lv_label_get_text(ui.health_), "MEASURING TREND") == 0);
+  ui.setBacklight(true);
+  ui.last_activity_ms_ = host_millis;
   ui.setElectronicsTemperatures(NAN, NAN);
   assert(findLabelContaining(lv_scr_act(), "MAX --°C / CPU --°C"));
   ui.setElectronicsTemperatures(26.0F, 41.0F);
@@ -197,18 +214,18 @@ int main(int argc, char** argv) {
   press(ui, ui.brightness_button_); advance(ui, 250); release(ui);
   assert(ui.brightnessPercent() == 55);
   assert(!ui.consumeBrightnessChange());
-  // Real LVGL pointer path: 40 px upward raises 55% to 87%.
+  // Real LVGL pointer path: 40 px upward raises 55% to 88%.
   press(ui, ui.brightness_button_); advance(ui, 310);
   host_touch_point.y -= 40; advance(ui, 20);
-  assert(ui.brightnessPercent() == 87);
+  assert(ui.brightnessPercent() == 88);
   release(ui);
   assert(ui.consumeBrightnessChange());
   assert(!ui.consumeBrightnessChange());
-  // Relative downward drag dims and clamps at 5%. One completed gesture -> one save.
+  // Relative downward drag dims and clamps at 1%. One completed gesture -> one save.
   press(ui, ui.brightness_button_); advance(ui, 310);
   host_touch_point.y += 120; advance(ui, 20);
-  assert(ui.brightnessPercent() == 5);
-  assert(host_ledc_duty == 5U * 255U / 100U);
+  assert(ui.brightnessPercent() == 1);
+  assert(host_ledc_duty == 1U * 255U / 100U);
   release(ui);
   assert(ui.consumeBrightnessChange());
   assert(!ui.consumeBrightnessChange());
@@ -357,6 +374,8 @@ int main(int argc, char** argv) {
   assert(std::strcmp(lv_label_get_text(ui.temperature_), "--.-") == 0);
   s.process_celsius = 25; ui.update(s, study);
   send(ui, UiCommand::ShowReflowRecipes); capture(out, "04-reflow-profiles");
+  assert(findLabelContaining(lv_scr_act(), "SMD291AXT5"));
+  assert(findLabelContaining(lv_scr_act(), "EXPERIMENTAL / 50% CAP"));
   send(ui, UiCommand::ShowCommissioning); capture(out, "05-heater-tests");
 
   // Review every real recipe, not extrapolated controls from a concept image.
@@ -375,9 +394,30 @@ int main(int argc, char** argv) {
 
   // Profile evidence is distinct from controller scope and engine completion.
   ui.showConfirm(RecipeId::LeadedReflow);
+  assert(findLabelContaining(lv_scr_act(), "PROFILE: EXPERIMENTAL"));
+  assert(findLabelContaining(lv_scr_act(), "30m / 50%"));
+  assert(findLabelContaining(lv_scr_act(), "220°C"));
   send(ui, UiCommand::ShowProfileResults); capture(out, "20-profile-specs-missing");
   assert(ui.screen_ == OvenUi::Screen::ProfileResults);
+  assert(findLabelContaining(lv_scr_act(), "TRIAL / NOT VALIDATED"));
   assert(!findButton("HOLD 2s: COMMISSION"));
+  profiles[0].report.metrics.peak_measured = true;
+  profiles[0].report.metrics.peak_celsius = 204.5F;
+  profiles[0].report.liquidus.measured = true;
+  profiles[0].report.liquidus.value = 84.0F;
+  profiles[0].report.liquidus.status = ValidationStatus::CriteriaMissing;
+  ui.setProfileValidation(profiles); ui.update(s, study);
+  capture(out, "20-profile-trial-measurements");
+  assert(findLabelContaining(lv_scr_act(), "~84s"));
+  assert(findLabelContaining(lv_scr_act(), "TAL / 183°C"));
+  assert(!findButton("HOLD 2s: COMMISSION"));
+  s.state = EngineState::Complete; s.recipe = &recipeFor(RecipeId::LeadedReflow);
+  ui.update(s, study); capture(out, "20-profile-trial-complete");
+  assert(findLabelContaining(lv_scr_act(), "PROFILE: EXPERIMENTAL"));
+  profiles[0].report.status = ValidationStatus::Incomplete;
+  ui.setProfileValidation(profiles); ui.update(s, study);
+  assert(findLabelContaining(lv_scr_act(), "PROFILE: INCOMPLETE"));
+  s.state = EngineState::Idle; ui.update(s, study); ui.showProfileResults();
   profiles[0].report.status = ValidationStatus::Pass;
   profiles[0].report.profile = ValidationProfile::Reflow;
   profiles[0].report.metrics.peak_measured = true;
@@ -532,10 +572,21 @@ int main(int argc, char** argv) {
   study.setup_revision = 1;
   ui.update(s, study); ui.showStudy(); capture(out, "50-study-locked");
   ui.showStudyResults(); capture(out, "51-results-active-no-candidate");
+  study.tune_report.available = study.tune_report.terminal = true;
+  study.tune_report.outcome = TuneOutcome::Timeout;
+  study.tune_report.latest.window_count = 3;
+  study.tune_report.latest.failed_checks = TuneAmplitudeLow | TuneFractionLow;
+  ui.update(s, study); ui.showStudyResults();
+  assert(findButton("USE LAST ESTIMATE"));
+  ui.queue(UiCommand::RecoverTuneCandidate);
+  assert(ui.consumeCommand() == UiCommand::RecoverTuneCandidate);
+  capture(out, "51b-recover-estimate");
   study.candidate_ready = true; study.candidate.kp = 2.4F;
   study.candidate.ki = 0.035F; study.candidate.kd = 7;
   ui.update(s, study); ui.showStudy(); capture(out, "52-study-candidate");
   ui.showStudyResults(); capture(out, "53-results-tests-needed");
+  assert(findLabelContaining(lv_scr_act(), "CANDIDATE / WARNINGS"));
+  assert(!findButton("USE LAST ESTIMATE"));
   assert(!findButton("HOLD 2s: SAVE + USE"));
   for (unsigned i = 0; i < 3; ++i) {
     auto& p = study.checks[i]; p.result = i == 0 ? StudyResult::Complete : StudyResult::Empty;
@@ -570,6 +621,75 @@ int main(int argc, char** argv) {
   send(ui, UiCommand::ShowStudyDetails); capture(out, "59-detail-band-not-reached");
   send(ui, UiCommand::DetailsBack);
   assert(!ui.canSaveStudy()); send(ui, UiCommand::SaveStudy);
+
+  // Rebooted saved scope is visible without inventing fresh run measurements.
+  const PidStudy previous_study = study;
+  study = PidStudy{};
+  study.candidate = study.active;
+  study.candidate_ready = study.saved = true;
+  study.candidate_revision = 1U;
+  study.checked_scope_mask = kControlCheck100Mask;
+  study.checked_setup_revision = study.setup_revision;
+  study.approved_checks_mask = kControlCheck100Mask | kControlCheck150Mask;
+  ui.update(s, study); ui.showStudyResults();
+  assert(ui.canSaveStudy());
+  assert(findLabelContaining(lv_scr_act(), "SAVED"));
+  assert(!findLabelContaining(lv_scr_act(), "REQUIRED CHECKS NEEDED"));
+  assert(!findButton("USE LAST ESTIMATE"));
+  capture(out, "59b-restored-100-scope");
+  ui.showConfirm(RecipeId::Check150);
+  assert(!ui.confirm_start_allowed_ && ui.confirm_reason_ == 6U);
+  const float previous_temperature = s.process_celsius;
+  s.process_celsius = 25.0F;
+  ui.update(s, study);
+  ui.showConfirm(RecipeId::Check150);
+  assert(ui.confirm_start_allowed_);
+  assert(findLabelContaining(lv_scr_act(), "25m / 25%"));
+  assert(findLabelContaining(lv_scr_act(), "Heat/hold: 20m; total: 25m."));
+  assert(findLabelContaining(lv_scr_act(), "heater-off cooling"));
+  capture(out, "59b-150-cooldown-budget-review");
+  study.approved_checks_mask = kAllControlChecksMask;
+  ui.update(s, study); ui.showConfirm(RecipeId::Check200);
+  assert(ui.confirm_start_allowed_);
+  assert(findLabelContaining(lv_scr_act(), "30m / 50%"));
+  assert(findLabelContaining(lv_scr_act(), "Heat/hold: 20m; total: 30m."));
+  assert(findLabelContaining(lv_scr_act(), "Extra 10m: heater-off cooling."));
+  assert(findLabelContaining(lv_scr_act(), "220°C"));
+  capture(out, "59b-200-cooldown-budget-review");
+  study.approved_checks_mask = kControlCheck100Mask | kControlCheck150Mask;
+  s.process_celsius = previous_temperature;
+  ui.update(s, study);
+  ui.showStudyDetails();
+  assert(findLabelContaining(lv_scr_act(), "metrics not retained"));
+  assert(!findLabelContaining(lv_scr_act(), "NOT REACHED"));
+  capture(out, "59c-restored-detail");
+  study.saved = false;
+  auto& extra_check = study.checks[1];
+  extra_check.result = StudyResult::Complete;
+  extra_check.setup_revision = study.setup_revision;
+  extra_check.candidate_revision = study.candidate_revision;
+  ui.update(s, study); ui.showStudyResults();
+  assert(ui.canSaveStudy() && findButton("HOLD 2s: SAVE + USE"));
+  assert(findLabelContaining(lv_scr_act(), "100+150°C"));
+  capture(out, "59d-extended-150-scope");
+  ui.details_page_ = 1; ui.showStudyDetails();
+  assert(findLabelContaining(lv_scr_act(), "TO 146°C"));
+  for (unsigned i = 0; i < 3; ++i) {
+    const PidGains original = study.candidate;
+    float& gain = i == 0 ? study.candidate.kp : i == 1 ? study.candidate.ki : study.candidate.kd;
+    gain = std::nextafter(gain, std::numeric_limits<float>::infinity());
+    ui.update(s, study); ui.showStudyResults();
+    assert(!ui.canSaveStudy() && !findButton("HOLD 2s: SAVE + USE"));
+    study.candidate = original;
+  }
+  study.checks[0].result = StudyResult::Aborted;
+  ui.update(s, study); ui.showStudyResults();
+  assert(!ui.canSaveStudy());
+  study.checks[0] = {};
+  ++study.setup_revision;
+  ui.update(s, study); ui.showStudyResults();
+  assert(!ui.canSaveStudy());
+  study = previous_study;
 
   // Every fault variant. Faults take over menus/runs; detail navigation never
   // acknowledges, starts, or modifies rejection thresholds.

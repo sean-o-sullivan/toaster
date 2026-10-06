@@ -50,8 +50,8 @@ constexpr RecipePhase kCommission200Phases[] = {
 };
 
 constexpr Recipe kRecipes[] = {
-    {RecipeId::LeadedReflow, "SnPb reflow", RunMode::Reflow, kLeadedPhases,
-     static_cast<uint8_t>(sizeof(kLeadedPhases) / sizeof(kLeadedPhases[0])), 183.0F, 220.0F, false, 1800, 100.0F},
+    {RecipeId::LeadedReflow, "SMD291AXT5 trial", RunMode::Reflow, kLeadedPhases,
+     static_cast<uint8_t>(sizeof(kLeadedPhases) / sizeof(kLeadedPhases[0])), 183.0F, 220.0F, false, 1800, 50.0F},
     {RecipeId::Sac305Reflow, "SAC305 reflow", RunMode::Reflow, kSac305Phases,
      static_cast<uint8_t>(sizeof(kSac305Phases) / sizeof(kSac305Phases[0])), 217.0F, 245.0F, true, 1800, 100.0F},
     {RecipeId::Nylon6Anneal, "Nylon-6 anneal", RunMode::Anneal, kNylon6Phases,
@@ -65,13 +65,13 @@ constexpr Recipe kRecipes[] = {
     {RecipeId::Commission200, "Commission 200 C", RunMode::Commissioning, kCommission200Phases,
      3, 0.0F, 220.0F, false, 1200, 25.0F},
     {RecipeId::Autotune100, "Autotune 100 C", RunMode::Autotune, kCommission100Phases,
-     3, 0.0F, 120.0F, false, 1200, 25.0F},
+     3, 0.0F, 120.0F, false, 1800, 25.0F},
     {RecipeId::Check100, "Check control 100 C", RunMode::Validation, kCommission100Phases,
      3, 0.0F, 120.0F, false, 1200, 25.0F},
     {RecipeId::Check150, "Check control 150 C", RunMode::Validation, kCommission150Phases,
-     3, 0.0F, 170.0F, false, 1200, 25.0F},
+     3, 0.0F, 170.0F, false, 1500, 25.0F},
     {RecipeId::Check200, "Check control 200 C", RunMode::Validation, kCommission200Phases,
-     3, 0.0F, 220.0F, false, 1200, 25.0F},
+     3, 0.0F, 220.0F, false, 1800, 50.0F},
 };
 
 constexpr Recipe kInvalidRecipe = {
@@ -118,6 +118,11 @@ const Recipe& recipeFor(RecipeId id) {
     }
   }
   return kInvalidRecipe;
+}
+
+uint32_t recipeHeatingDeadlineSeconds(const Recipe& recipe) {
+  return recipe.id == RecipeId::Check150 || recipe.id == RecipeId::Check200
+      ? 1200U : recipe.maximum_run_seconds;
 }
 
 const char* toString(EngineState state) {
@@ -216,6 +221,7 @@ bool ThermalEngine::start(RecipeId recipe_id, uint32_t now_ms, const Thermocoupl
   }
   const int check_index = controlCheckIndex(recipe_id);
   if (check_index >= 0) {
+    study_.saved = study_.save_failed = false;
     const uint32_t attempts = study_.checks[check_index].attempts + 1;
     study_.checks[check_index] = {};
     study_.checks[check_index].attempts = attempts;
@@ -311,7 +317,13 @@ void ThermalEngine::update(uint32_t now_ms, const ThermocoupleReading& process) 
 
   snapshot_.run_elapsed_seconds = (now_ms - run_started_ms_) / 1000U;
   snapshot_.phase_elapsed_seconds = (now_ms - phase_started_ms_) / 1000U;
-  if (now_ms - run_started_ms_ >= snapshot_.recipe->maximum_run_seconds * 1000UL) {
+  const uint32_t elapsed_ms = now_ms - run_started_ms_;
+  const bool heater_off_cooldown = snapshot_.state == EngineState::Cooling &&
+      snapshot_.recipe->phases[snapshot_.phase_index].kind == PhaseKind::Cooldown &&
+      !snapshot_.heater_commanded_on && snapshot_.output_percent == 0.0F;
+  if (elapsed_ms >= snapshot_.recipe->maximum_run_seconds * 1000UL ||
+      (!heater_off_cooldown &&
+       elapsed_ms >= recipeHeatingDeadlineSeconds(*snapshot_.recipe) * 1000UL)) {
     if (snapshot_.recipe->mode == RunMode::Autotune) finishTuneReport(TuneOutcome::Timeout);
     fault(FaultCode::RunTimeout);
     return;
@@ -513,30 +525,40 @@ float controlCheckTargetCelsius(uint8_t index) {
 }
 
 bool ThermalEngine::canSaveStudy() const {
-  if (snapshot_.state != EngineState::Idle || !study_.candidate_ready ||
-      !validPidGains(study_.candidate)) return false;
-  for (uint8_t i = 0; i < kControlCheckCount; ++i) {
-    const uint8_t mask = static_cast<uint8_t>(1U << i);
-    if ((study_.required_checks_mask & mask) == 0U) continue;
-    const auto& check = study_.checks[i];
-    if (check.result != StudyResult::Complete ||
-        check.candidate_revision != study_.candidate_revision ||
-        check.setup_revision != study_.setup_revision) return false;
-  }
-  return true;
+  return snapshot_.state == EngineState::Idle && pidStudyChecksSatisfied(study_);
 }
 
 uint8_t ThermalEngine::candidateCheckedScope() const {
+  return pidCandidateCheckedScope(study_);
+}
+
+uint8_t pidCandidateCheckedScope(const PidStudy& study) {
+  if (!study.candidate_ready || !validPidGains(study.candidate)) return 0U;
   uint8_t checked_scope_mask = 0U;
+  if (study.setup_revision != 0U && study.checked_setup_revision == study.setup_revision &&
+      validPidGains(study.active) && study.candidate.kp == study.active.kp &&
+      study.candidate.ki == study.active.ki && study.candidate.kd == study.active.kd) {
+    checked_scope_mask = study.checked_scope_mask & kAllControlChecksMask;
+  }
   for (uint8_t i = 0; i < kControlCheckCount; ++i) {
-    const auto& check = study_.checks[i];
+    const auto& check = study.checks[i];
+    if (check.result == StudyResult::Empty) continue;
+    // A new attempt supersedes saved evidence for this temperature.
+    checked_scope_mask &= static_cast<uint8_t>(~(1U << i));
     if (check.result == StudyResult::Complete &&
-        check.candidate_revision == study_.candidate_revision &&
-        check.setup_revision == study_.setup_revision) {
+        check.candidate_revision == study.candidate_revision &&
+        check.setup_revision == study.setup_revision) {
       checked_scope_mask |= static_cast<uint8_t>(1U << i);
     }
   }
   return checked_scope_mask;
+}
+
+bool pidStudyChecksSatisfied(const PidStudy& study) {
+  const uint8_t required = study.required_checks_mask;
+  return study.setup_revision != 0U && required != 0U && (required & ~kAllControlChecksMask) == 0U &&
+      (required & study.approved_checks_mask) == required &&
+      (required & pidCandidateCheckedScope(study)) == required;
 }
 
 bool ThermalEngine::configureControlChecks(uint8_t required_checks_mask,
@@ -574,13 +596,22 @@ bool ThermalEngine::loadPid(const PidGains& gains, uint8_t checked_scope_mask,
   study_.active = gains;
   study_.checked_scope_mask = checked_scope_mask;
   study_.checked_setup_revision = checked_scope_mask == 0U ? 0U : setup_revision;
+  if (checked_scope_mask != 0U && setup_revision == study_.setup_revision) {
+    // Restore the actual saved gains; do not reconstruct them from an old tune.
+    study_.candidate = gains;
+    study_.candidate_ready = true;
+    ++study_.candidate_revision;
+    study_.saved = true;
+    study_.save_failed = false;
+  }
   return true;
 }
 
 bool ThermalEngine::acceptStudy() {
   if (!canSaveStudy()) return false;
+  const uint8_t checked_scope = candidateCheckedScope();
   study_.active = study_.candidate;
-  study_.checked_scope_mask = candidateCheckedScope();
+  study_.checked_scope_mask = checked_scope;
   study_.checked_setup_revision = study_.setup_revision;
   study_.saved = true;
   study_.save_failed = false;
@@ -591,6 +622,31 @@ bool ThermalEngine::loadTuneReport(const TuneRunReport& report) {
   if (snapshot_.state != EngineState::Idle || !report.available || !report.terminal) return false;
   study_.tune_report = report;
   tune_report_sequence_ = report.sequence;
+  return true;
+}
+
+bool ThermalEngine::recoverTuneCandidate() {
+  const auto& report = study_.tune_report;
+  if (snapshot_.state != EngineState::Idle || study_.candidate_ready ||
+      !report.available || !report.terminal ||
+      (report.outcome != TuneOutcome::Timeout && report.outcome != TuneOutcome::Unstable))
+    return false;
+  PidGains gains;
+  if (!RelayAutotune::estimateCandidate(report.latest, gains)) return false;
+  study_.candidate = gains;
+  study_.candidate_ready = true;
+  ++study_.candidate_revision;
+  study_.saved = false;
+  study_.save_failed = false;
+  study_.cycles = report.cycles;
+  study_.period_seconds = 0.0F;
+  study_.amplitude_celsius = 0.0F;
+  for (const auto& cycle : report.latest.window) {
+    study_.period_seconds += cycle.period / 3.0F;
+    study_.amplitude_celsius += cycle.amplitude / 3.0F;
+  }
+  for (auto& check : study_.checks) check = {};
+  // Historical report stays unchanged. Candidate is neither active nor checked.
   return true;
 }
 

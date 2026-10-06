@@ -22,6 +22,9 @@ uint32_t recipeIdentity(const Recipe& recipe) {
   };
   add(&recipe.id, sizeof(recipe.id));
   add(&recipe.liquidus_celsius, sizeof(recipe.liquidus_celsius));
+  add(&recipe.maximum_output_percent, sizeof(recipe.maximum_output_percent));
+  add(&recipe.maximum_process_celsius, sizeof(recipe.maximum_process_celsius));
+  add(&recipe.maximum_run_seconds, sizeof(recipe.maximum_run_seconds));
   for (uint8_t i = 0; i < recipe.phase_count; ++i) {
     const auto& phase = recipe.phases[i];
     add(&phase.kind, sizeof(phase.kind));
@@ -120,6 +123,15 @@ void ValidationRuntime::update(const ThermalEngine& engine, uint32_t now_ms) {
     view.commissioned = false;
     terminal_pending_ = true;
     ++sequence_;
+  }
+  // Trial TAL uses the existing whole-second engine counter, not a PASS criterion.
+  if (latest_profile_ == 0U && s.recipe && s.recipe->id == RecipeId::LeadedReflow &&
+      !validRequirements(requirementsForProfile(0U)) &&
+      view.report.status != ValidationStatus::Incomplete && view.report.metrics.sample_count) {
+    view.report.metrics.liquidus_accumulated_ms = s.liquidus_elapsed_seconds * 1000U;
+    view.report.liquidus.measured = true;
+    view.report.liquidus.value = static_cast<float>(s.liquidus_elapsed_seconds);
+    view.report.liquidus.status = ValidationStatus::CriteriaMissing;
   }
 }
 

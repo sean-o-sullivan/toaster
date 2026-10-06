@@ -82,10 +82,10 @@ int main(int argc, char** argv) {
   assert(argc == 2);
   OvenUi ui;
   assert(ui.begin(1));
-  assert(ui.brightnessPercent() == 5);
+  assert(ui.brightnessPercent() == 1);
   assert(host_ledc_channel == 7 && host_ledc_pin == 45);
   assert(host_ledc_frequency == 5000 && host_ledc_resolution == 8);
-  assert(host_ledc_duty == 5U * 255U / 100U);
+  assert(host_ledc_duty == 1U * 255U / 100U);
   assert(!ui.consumeBrightnessChange());
   EngineSnapshot snapshot;
   snapshot.probe_healthy = true;

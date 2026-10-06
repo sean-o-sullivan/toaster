@@ -34,6 +34,8 @@ constexpr uint16_t kBootDisplayWidth = kScreenHeight;
 constexpr uint16_t kBootDisplayHeight = kScreenWidth;
 constexpr uint16_t kBootCropWidth = kBootHeight * kBootDisplayWidth / kBootDisplayHeight;
 constexpr uint16_t kBootCropX = (kBootWidth - kBootCropWidth) / 2;
+// Boot-only 8px overpaint: a ragged front, then the actual menu pixels.
+int g_boot_reveal = -1;
 
 extern const uint8_t kBootFramesStart[]
     asm("_binary_assets_boot_history_hot_240x135_12_5fps_rgb565_start");
@@ -141,7 +143,7 @@ const char* modeName(RecipeId id) {
 }
 const char* recipeName(RecipeId id) {
   switch (id) {
-    case RecipeId::LeadedReflow: return "SnPb solder profile";
+    case RecipeId::LeadedReflow: return "SMD291AXT5 / trial";
     case RecipeId::Sac305Reflow: return "SAC305 solder profile";
     case RecipeId::Nylon6Anneal: return "Nylon-6 fixed profile";
     case RecipeId::CustomAnneal: return "Custom anneal program";
@@ -246,30 +248,31 @@ int profileIndex(RecipeId id) {
 const char* controllerScope(const PidStudy& study) {
   if (study.checked_scope_mask == 0U) return "LEGACY / UNVERIFIED";
   if (study.checked_scope_mask == kControlCheck100Mask) return "CHECKED 100°C ONLY";
+  if (study.checked_scope_mask == (kControlCheck100Mask | kControlCheck150Mask)) return "CHECKED 100/150°C";
   if (study.checked_scope_mask == kAllControlChecksMask) return "CHECKED 100-200°C";
   return "CHECKED / LIMITED SCOPE";
 }
-const char* controllerScopeShort(const PidStudy& study) {
-  if (study.checked_scope_mask == 0U) return "UNVERIFIED";
-  if (study.checked_scope_mask == kControlCheck100Mask) return "100°C ONLY";
-  if (study.checked_scope_mask == kAllControlChecksMask) return "100-200°C";
+const char* controllerScopeShort(uint8_t scope) {
+  if (scope == 0U) return "UNVERIFIED";
+  if (scope == kControlCheck100Mask) return "100°C ONLY";
+  if (scope == (kControlCheck100Mask | kControlCheck150Mask)) return "100+150°C";
+  if (scope == kAllControlChecksMask) return "100-200°C";
   return "LIMITED";
 }
-uint8_t candidateScope(const PidStudy& study) {
-  uint8_t mask = 0U;
-  for (unsigned i = 0; i < kControlCheckCount; ++i) {
-    const auto& check = study.checks[i];
-    if (check.result == StudyResult::Complete && check.setup_revision == study.setup_revision &&
-        check.candidate_revision == study.candidate_revision) mask |= static_cast<uint8_t>(1U << i);
-  }
-  return mask;
+const char* controllerScopeShort(const PidStudy& study) {
+  return controllerScopeShort(study.checked_scope_mask);
 }
-const char* profileStatus(const ProfileValidationView& view) {
+bool experimentalLeadedProfile(RecipeId id, const ProfileValidationView& view) {
+  return id == RecipeId::LeadedReflow && view.report.status == ValidationStatus::CriteriaMissing;
+}
+const char* profileStatus(const ProfileValidationView& view, RecipeId id) {
+  if (experimentalLeadedProfile(id, view)) return "EXPERIMENTAL";
   if (view.needs_revalidation) return "NEEDS REVALIDATION";
   if (view.commissioned) return "COMMISSIONED / FIXED SETUP";
   return toString(view.report.status);
 }
-const char* profileStatusShort(const ProfileValidationView& view) {
+const char* profileStatusShort(const ProfileValidationView& view, RecipeId id) {
+  if (experimentalLeadedProfile(id, view)) return "EXPERIMENTAL";
   if (view.needs_revalidation) return "REVALIDATE";
   if (view.commissioned) return "COMMISSIONED";
   if (view.report.status == ValidationStatus::CriteriaMissing) return "SPECS MISSING";
@@ -407,6 +410,18 @@ bool OvenUi::begin(uint8_t brightness_percent) {
   last_activity_ms_ = last_lv_tick_ms_;
   backlight_awake_ = true;
   showHome();
+#ifdef TOASTER_BOOT_ANIMATION
+  for (int step = 0; step <= 52; ++step) {
+    g_boot_reveal = step;
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(nullptr);
+    delay(16);
+  }
+  g_boot_reveal = -1;
+  lv_obj_invalidate(lv_scr_act());
+  lv_refr_now(nullptr);
+  last_lv_tick_ms_ = last_activity_ms_ = millis();
+#endif
   return touch_ready;
 }
 
@@ -459,7 +474,7 @@ void OvenUi::playBootAnimation() {
   }
   g_tft.setSwapBytes(false);
   g_tft.setRotation(0);
-  g_tft.fillScreen(TFT_BLACK);
+  // Keep the final HOT frame on the glass until the menu overpaints it.
 #else
   g_tft.fillScreen(TFT_BLACK);
   ledcWrite(kBacklightPwmChannel,
@@ -538,6 +553,7 @@ void OvenUi::updateHold() {
 }
 
 void OvenUi::update(const EngineSnapshot& snapshot, const PidStudy& study) {
+  temperature_trend_.update(millis(), snapshot.process_celsius, snapshot.probe_healthy);
   bool study_changed = study.saved != study_.saved || study.save_failed != study_.save_failed ||
       study.candidate_ready != study_.candidate_ready || study.tune_report.sequence != study_.tune_report.sequence;
   for (int i = 0; i < 3; ++i)
@@ -611,6 +627,14 @@ UiCommand OvenUi::consumeCommand() {
     return screen_ == Screen::AnnealReview && customAnnealCanStart() ? command : UiCommand::None;
   if (command == UiCommand::SaveStudy)
     return screen_ == Screen::StudyResults && canSaveStudy() && !study_.saved ? command : UiCommand::None;
+  if (command == UiCommand::RecoverTuneCandidate) {
+    const auto& report = study_.tune_report;
+    const bool recoverable = report.available && report.terminal && !study_.candidate_ready &&
+        (report.outcome == TuneOutcome::Timeout || report.outcome == TuneOutcome::Unstable) &&
+        report.latest.window_count == 3;
+    return screen_ == Screen::StudyResults && engine_state_ == EngineState::Idle && recoverable
+        ? command : UiCommand::None;
+  }
   if (command == UiCommand::CommissionProfile)
     return screen_ == Screen::ProfileResults && canCommissionSelectedProfile() ? command : UiCommand::None;
   if (command == UiCommand::Acknowledge) {
@@ -746,7 +770,7 @@ void OvenUi::showRecipeList() {
   for (int i = 0; i < 2; ++i) {
     const auto& p = recipeFor(ids[i]);
     const int y = 64 + i * 80;
-    auto* b = button(r, i ? "SAC305" : "SnPb", 8, y, 224, 72, Surface,
+    auto* b = button(r, i ? "SAC305" : "SMD291AXT5", 8, y, 224, 72, Surface,
                     i ? UiCommand::ChooseSac305 : UiCommand::ChooseLeaded);
     lv_obj_align(lv_obj_get_child(b, 0), LV_ALIGN_TOP_LEFT, 10, 6);
     box(b, 0, 0, 3, 72, Reflow);
@@ -755,7 +779,8 @@ void OvenUi::showRecipeList() {
     label(b, text, 10, 29, &lv_font_montserrat_14, Muted);
     const auto& view = profile_validation_[profileIndex(ids[i])];
     label(b, i ? "LOCKED / NOT COMMISSIONED" :
-          profileStatus(view), 10, 51,
+          experimentalLeadedProfile(ids[i], view) ? "EXPERIMENTAL / 50% CAP" :
+          profileStatus(view, ids[i]), 10, 51,
           &lv_font_montserrat_12, i ? Muted : Reflow);
     label(b, ">", 207, 7, &lv_font_montserrat_20, Reflow);
   }
@@ -767,7 +792,7 @@ void OvenUi::showCommissioning() {
   prepareScreen(Screen::Commissioning);
   auto* r = lv_scr_act();
   header(r, "HEATER TESTS", "SUPERVISED TESTS", Test, TestMask);
-  label(r, "25% cap / 20 min run limit", 8, 58, &lv_font_montserrat_14, Muted);
+  label(r, "25% cap / review shows run limits", 8, 58, &lv_font_montserrat_12, Muted);
   button(r, "100°C / 5 MIN HOLD", 8, 80, 224, 40, Test, UiCommand::ChooseCommission100);
   button(r, "150°C / 5 MIN HOLD", 8, 124, 224, 40, Test, UiCommand::ChooseCommission150);
   button(r, "200°C / 5 MIN HOLD", 8, 168, 224, 40, Test, UiCommand::ChooseCommission200);
@@ -1006,10 +1031,17 @@ void OvenUi::showConfirm(RecipeId id) {
     "Suitability / check plan is\nnot approved at this target."
   };
   const int profile_index = profileIndex(id);
-  if (profile_index >= 0 && confirm_reason_ == 0) {
+  const uint32_t heating_deadline = recipeHeatingDeadlineSeconds(recipe);
+  if (heating_deadline < recipe.maximum_run_seconds && confirm_reason_ == 0) {
+    std::snprintf(text, sizeof(text), "Heat/hold: %lum; total: %lum.\nExtra %lum: heater-off cooling.",
+        (unsigned long)(heating_deadline / 60U),
+        (unsigned long)(recipe.maximum_run_seconds / 60U),
+        (unsigned long)((recipe.maximum_run_seconds - heating_deadline) / 60U));
+    label(r, text, 8, 184, &lv_font_montserrat_12, Muted, 224);
+  } else if (profile_index >= 0 && confirm_reason_ == 0) {
     char status[96];
     std::snprintf(status, sizeof(status), "CONTROL: %s\nPROFILE: %s",
-                  controllerScope(study_), profileStatus(profile_validation_[profile_index]));
+                  controllerScope(study_), profileStatus(profile_validation_[profile_index], id));
     label(r, status, 8, 184, &lv_font_montserrat_12, Muted);
   } else label(r, notes[confirm_reason_], 8, 184, &lv_font_montserrat_14,
                confirm_start_allowed_ ? Muted : Caution, 224);
@@ -1126,8 +1158,10 @@ void OvenUi::showComplete() {
   char result[128];
   if (profile) {
     const auto& view = profile_validation_[profile_index];
-    std::snprintf(result, sizeof(result), "PROFILE: %s\nREPEATS: %u / %u\nACK TO REVIEW RESULTS",
-                  profileStatus(view), view.consecutive_passes, ValidationSequence::kRequiredPasses);
+    if (experimentalLeadedProfile(selected_recipe_, view))
+      std::snprintf(result, sizeof(result), "PROFILE: EXPERIMENTAL\nInspect solder wetting.\nACK TO REVIEW MEASUREMENTS");
+    else std::snprintf(result, sizeof(result), "PROFILE: %s\nREPEATS: %u / %u\nACK TO REVIEW RESULTS",
+                  profileStatus(view, selected_recipe_), view.consecutive_passes, ValidationSequence::kRequiredPasses);
   }
   detail_ = label(r, isStudyRecipe(selected_recipe_) ?
                  "Control check recorded.\nNo profile claim is made.\nCheck before handling." : profile ? result :
@@ -1161,17 +1195,7 @@ void OvenUi::showStudy() {
 }
 
 bool OvenUi::canSaveStudy() const {
-  if (engine_state_ != EngineState::Idle || !study_.candidate_ready || !validPidGains(study_.candidate)) return false;
-  const uint8_t required = study_.required_checks_mask;
-  if (!required || (required & study_.approved_checks_mask) != required ||
-      (required & candidateScope(study_)) != required) return false;
-  for (unsigned i = 0; i < 3; ++i) {
-    if (!(required & (1U << i))) continue;
-    const auto& check = study_.checks[i];
-    if (check.result != StudyResult::Complete || check.setup_revision != study_.setup_revision ||
-        check.candidate_revision != study_.candidate_revision) return false;
-  }
-  return true;
+  return engine_state_ == EngineState::Idle && pidStudyChecksSatisfied(study_);
 }
 
 bool OvenUi::canCommissionSelectedProfile() const {
@@ -1182,11 +1206,15 @@ bool OvenUi::canCommissionSelectedProfile() const {
 
 void OvenUi::showStudyResults() {
   prepareScreen(Screen::StudyResults);
+  const bool candidate_warnings = study_.candidate_ready && study_.tune_report.latest.failed_checks != 0;
   auto* r = lv_scr_act();
   header(r, "PID RESULTS", study_.save_failed ? "FAILED / OLD PID KEPT" : study_.saved ? "SAVED / ACTIVE" :
+         candidate_warnings ? "CANDIDATE / WARNINGS" :
          study_.candidate_ready ? "CANDIDATE / NOT SAVED" : "ACTIVE / NO CANDIDATE", Test, TestMask);
   auto* table = box(r, 8, 60, 224, 77, Surface);
   char text[64];
+  const uint8_t candidate_scope = pidCandidateCheckedScope(study_);
+  const uint8_t shown_scope = study_.candidate_ready ? candidate_scope : study_.checked_scope_mask;
   std::snprintf(text, sizeof(text), "%.1f/%.3f/%.0f", (double)study_.active.kp,
                 (double)study_.active.ki, (double)study_.active.kd);
   field(table, "ACTIVE P/I/D", text, 7);
@@ -1194,25 +1222,31 @@ void OvenUi::showStudyResults() {
       (double)study_.candidate.kp, (double)study_.candidate.ki, (double)study_.candidate.kd);
   else std::snprintf(text, sizeof(text), "--");
   field(table, "CANDIDATE", text, 30);
-  field(table, "SCOPE", controllerScopeShort(study_), 53);
+  field(table, "SCOPE", controllerScopeShort(shown_scope), 53);
   for (int i = 0; i < 3; ++i) {
     auto* p = box(r, 8 + i * 76, 145, 72, 43, Surface);
     const char* targets[] = {"100°C", "150°C", "200°C"};
     auto* t = label(p, targets[i], 0, 1, &lv_font_montserrat_16); lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 1);
     const bool approved = study_.approved_checks_mask & (1U << i);
-    t = label(p, approved ? resultName(study_.checks[i].result) : "LOCKED", 0, 24, &lv_font_montserrat_12, Muted);
+    const bool retained = (candidate_scope & (1U << i)) && study_.checks[i].result == StudyResult::Empty;
+    t = label(p, approved ? retained ? "SAVED" : resultName(study_.checks[i].result) : "LOCKED", 0, 24, &lv_font_montserrat_12, Muted);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 24);
-    if (study_.checks[i].result == StudyResult::Complete) box(p, 0, 40, 72, 3, Test);
+    if (candidate_scope & (1U << i)) box(p, 0, 40, 72, 3, Test);
   }
-  const uint8_t shown_scope = study_.saved ? study_.checked_scope_mask : candidateScope(study_);
   label(r, study_.save_failed ? "Save failed. Old PID kept.\nCandidate remains unsaved." :
         shown_scope == 1U ? "CHECKED AT 100°C ONLY\nPROFILE: SPECS MISSING" :
+        shown_scope == 3U ? "CHECKED AT 100/150°C\nPROFILE: SPECS MISSING" :
         "Controller scope shown above.\nPROFILE: SPECS MISSING", 8, 190, &lv_font_montserrat_14, Muted);
   if (study_.saved) {
     auto* b = box(r, 8, 230, 224, 32, Test);
     auto* t = label(b, "SAVED / ACTIVE PID", 0, 0, &lv_font_montserrat_14, Ink); lv_obj_center(t);
   } else if (canSaveStudy()) button(r, study_.save_failed ? "HOLD 2s: RETRY SAVE" :
       "HOLD 2s: SAVE + USE", 8, 224, 224, 40, Test, UiCommand::SaveStudy, true);
+  else if (!study_.candidate_ready && study_.tune_report.available && study_.tune_report.terminal &&
+           (study_.tune_report.outcome == TuneOutcome::Timeout ||
+       study_.tune_report.outcome == TuneOutcome::Unstable) &&
+           study_.tune_report.latest.window_count == 3)
+    button(r, "USE LAST ESTIMATE", 8, 224, 224, 40, Test, UiCommand::RecoverTuneCandidate);
   else label(r, "REQUIRED CHECKS NEEDED", 8, 239, &lv_font_montserrat_12, Muted);
   button(r, "BACK", 8, 268, 108, 44, Surface, UiCommand::ShowStudy);
   button(r, "DETAILS", 124, 268, 108, 44, Surface, UiCommand::ShowStudyDetails);
@@ -1223,8 +1257,10 @@ void OvenUi::showStudyDetails() {
   auto* r = lv_scr_act();
   char text[100];
   const unsigned targets[] = {100, 150, 200};
+  const bool retained = study_.checks[details_page_].result == StudyResult::Empty &&
+      (pidCandidateCheckedScope(study_) & (1U << details_page_));
   std::snprintf(text, sizeof(text), "CHECK %u°C / %s", targets[details_page_],
-                resultName(study_.checks[details_page_].result));
+                retained ? "SAVED" : resultName(study_.checks[details_page_].result));
   header(r, "CHECK DETAIL", text, Test, TestMask);
   const auto& p = study_.checks[details_page_];
   auto* table = box(r, 8, 60, 224, 153, Surface);
@@ -1232,9 +1268,13 @@ void OvenUi::showStudyDetails() {
   std::snprintf(text, sizeof(text), "%lu", (unsigned long)p.attempts); field(table, "ATTEMPTS", text, 7);
   std::snprintf(text, sizeof(text), "%.1f°C", (double)p.start_celsius); field(table, "START", available ? text : "--", 30);
   std::snprintf(text, sizeof(text), "%.1f°C", (double)p.peak_celsius); field(table, "PEAK", available ? text : "--", 53);
-  std::snprintf(text, sizeof(text), "%lus", (unsigned long)p.rise_seconds); field(table, "TO 96°C", p.reached_band ? text : "NOT REACHED", 76);
+  char rise_label[16];
+  std::snprintf(rise_label, sizeof(rise_label), "TO %u°C", targets[details_page_] - 4U);
+  std::snprintf(text, sizeof(text), "%lus", (unsigned long)p.rise_seconds);
+  field(table, rise_label, p.reached_band ? text : available ? "NOT REACHED" : "--", 76);
   std::snprintf(text, sizeof(text), "%.2f°C", (double)p.hold_rmse); field(table, "HOLD RMS", p.reached_band ? text : "--", 99);
   std::snprintf(text, sizeof(text), "%.1f%%", (double)p.hold_output_percent); field(table, "MEAN DEMAND", p.reached_band ? text : "--", 122);
+  if (retained) label(r, "Saved scope; metrics not retained.", 8, 194, &lv_font_montserrat_12, Muted);
   button(r, "< PREV", 8, 224, 108, 40, Test, UiCommand::DetailsPrevious);
   button(r, "NEXT >", 124, 224, 108, 40, Test, UiCommand::DetailsNext);
   button(r, "BACK", 8, 268, 224, 44, Surface, UiCommand::DetailsBack);
@@ -1255,14 +1295,14 @@ void OvenUi::showTuneDetails() {
     std::snprintf(text, sizeof(text), "%.1f%%", (double)d.fraction * 100); field(table, "HEAT FRACTION", text, 53);
     std::snprintf(text, sizeof(text), "%.2f°C", (double)d.amplitude); field(table, "AMPLITUDE", text, 76);
     std::snprintf(text, sizeof(text), "%.2f°C", (double)d.midpoint); field(table, "MIDPOINT", text, 99);
-    label(r, "Limits: P 40-300s / F 30-70%\nA 2-12°C / M 96-104°C", 8, 194, &lv_font_montserrat_12, Muted);
+    label(r, "Reference: P 40-300s / F 30-70%\nA 2-12°C / M 96-104°C", 8, 194, &lv_font_montserrat_12, Muted);
   } else if (details_page_ == 1) {
     std::snprintf(text, sizeof(text), "%u/3", d.window_count); field(table, "WINDOW", text, 7);
     std::snprintf(text, sizeof(text), "%.2f", (double)d.period_ratio); field(table, "PERIOD RATIO", text, 30);
     std::snprintf(text, sizeof(text), "%.2f", (double)d.amplitude_ratio); field(table, "AMPL. RATIO", text, 53);
     std::snprintf(text, sizeof(text), "%.2f°C", (double)d.midpoint_span); field(table, "MIDPOINT SPAN", text, 76);
-    std::snprintf(text, sizeof(text), "0x%04lX", (unsigned long)d.failed_checks); field(table, "FAIL MASK", text, 99);
-    label(r, "Ratios <=1.2 / span <=1°C.\nDo not relax rejection limits.", 8, 194, &lv_font_montserrat_12, Muted);
+    std::snprintf(text, sizeof(text), "0x%04lX", (unsigned long)d.failed_checks); field(table, "CHECK FLAGS", text, 99);
+    label(r, "Ratios <=1.2 / span <=1°C.\nQuality warnings; test response.", 8, 194, &lv_font_montserrat_12, Muted);
   } else {
     // Latest three measurements, all in one small table. Limits stay on page 1.
     label(table, "CYCLE / PERIOD / AMPL / MID", 8, 7, &lv_font_montserrat_12, Muted);
@@ -1290,14 +1330,16 @@ void OvenUi::showProfileResults() {
   const auto& view = profile_validation_[index];
   const auto& report = view.report;
   const uint32_t accent = modeColor(selected_recipe_);
-  header(r, "PROFILE REVIEW", profileStatusShort(view), accent, modeMask(selected_recipe_));
+  const bool experimental = experimentalLeadedProfile(selected_recipe_, view);
+  header(r, "PROFILE REVIEW", profileStatusShort(view, selected_recipe_), accent, modeMask(selected_recipe_));
   auto* identity = box(r, 8, 60, 224, 68, Surface);
   field(identity, "CONTROL", controllerScopeShort(study_), 7);
-  field(identity, "PROFILE", profileStatusShort(view), 29);
+  field(identity, "PROFILE", profileStatusShort(view, selected_recipe_), 29);
   char text[64];
-  std::snprintf(text, sizeof(text), "%u / %u", view.consecutive_passes,
-                ValidationSequence::kRequiredPasses);
-  field(identity, "REPEATS", text, 51);
+  if (experimental) std::snprintf(text, sizeof(text), "205°C / 50%%");
+  else std::snprintf(text, sizeof(text), "%u / %u", view.consecutive_passes,
+                     ValidationSequence::kRequiredPasses);
+  field(identity, experimental ? "RECIPE" : "REPEATS", text, 51);
   auto* metrics = box(r, 8, 132, 224, 90, Surface);
   if (report.profile == ValidationProfile::Anneal) {
     if (report.metrics.warmup_measured) std::snprintf(text, sizeof(text), "%.1fs",
@@ -1319,9 +1361,9 @@ void OvenUi::showProfileResults() {
     if (report.metrics.peak_measured) std::snprintf(text, sizeof(text), "%.1f°C",
         (double)report.metrics.peak_celsius); else std::snprintf(text, sizeof(text), "--");
     field(metrics, "PEAK", text, 29);
-    if (report.liquidus.measured) std::snprintf(text, sizeof(text), "%.1fs",
+    if (report.liquidus.measured) std::snprintf(text, sizeof(text), experimental ? "~%.0fs" : "%.1fs",
         (double)report.liquidus.value); else std::snprintf(text, sizeof(text), "--");
-    field(metrics, "LIQUIDUS", text, 51);
+    field(metrics, experimental ? "TAL / 183°C" : "LIQUIDUS", text, 51);
     if (report.metrics.cooling_slope_measured) std::snprintf(text, sizeof(text), "%.2f°C/s",
         (double)report.metrics.cooling_slope_celsius_per_second); else std::snprintf(text, sizeof(text), "--");
     field(metrics, "COOL SLOPE", text, 73);
@@ -1334,7 +1376,8 @@ void OvenUi::showProfileResults() {
            UiCommand::CommissionProfile, true);
   } else {
     auto* b = box(r, 8, 224, 224, 40, Surface, Border);
-    auto* t = label(b, report.status == ValidationStatus::CriteriaMissing ? "SPECS MISSING" :
+    auto* t = label(b, experimental ? "TRIAL / NOT VALIDATED" :
+                    report.status == ValidationStatus::CriteriaMissing ? "SPECS MISSING" :
                     view.consecutive_passes < ValidationSequence::kRequiredPasses ? "REPEATS REQUIRED" :
                     "NOT ELIGIBLE", 0, 0, &lv_font_montserrat_14, Caution); lv_obj_center(t);
   }
@@ -1359,7 +1402,14 @@ void OvenUi::refreshDynamic(const EngineSnapshot& s) {
     }
   }
   if (screen_ == Screen::Home) {
-    setText(health_, probe_healthy_ ? "PROBE VALID / CMD OFF" : "CHECK PROBE / CMD OFF");
+    if (!probe_healthy_) std::snprintf(text, sizeof(text), "CHECK PROBE");
+    else if (!temperature_trend_.ready()) std::snprintf(text, sizeof(text), "MEASURING TREND");
+    else if (temperature_trend_.state() == TrendState::Stable)
+      std::snprintf(text, sizeof(text), "STABLE");
+    else std::snprintf(text, sizeof(text), "%s %.1f°C/min",
+        temperature_trend_.state() == TrendState::Rising ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
+        (double)std::fabs(temperature_trend_.rateCelsiusPerMinute()));
+    setText(health_, text);
     lv_obj_set_style_text_color(health_, color(probe_healthy_ ? Muted : Caution), 0);
   }
   if (screen_ == Screen::Fault) {
@@ -1505,6 +1555,36 @@ void OvenUi::brightnessEventHandler(lv_event_t* event) {
 void OvenUi::displayFlush(lv_disp_drv_t* display, const lv_area_t* area, lv_color_t* pixels) {
   const uint32_t width = static_cast<uint32_t>(area->x2 - area->x1 + 1);
   const uint32_t height = static_cast<uint32_t>(area->y2 - area->y1 + 1);
+#ifdef TOASTER_BOOT_ANIMATION
+  if (g_boot_reveal >= 0) {
+    g_tft.startWrite();
+    for (int y = area->y1; y <= area->y2; ++y) {
+      for (int x = area->x1; x <= area->x2;) {
+        const int count = std::min(8 - x % 8, area->x2 - x + 1);
+        const unsigned tx = x / 8, ty = y / 8;
+        const unsigned hash = (tx * 73U + ty * 151U + (tx ^ ty) * 19U);
+        const int arrival = static_cast<int>(ty + hash % 11U);
+        if (g_boot_reveal >= arrival && g_boot_reveal <= arrival + 2) {
+          uint16_t edge[8];
+          auto* source = reinterpret_cast<uint16_t*>(pixels) +
+              (y - area->y1) * width + x - area->x1;
+          if (g_boot_reveal < arrival + 2) {
+            const uint32_t palette[] = {Surface, Border, Reflow, Anneal, Chamber};
+            const uint16_t ink = lv_color_hex(palette[hash % 5U]).full;
+            for (int i = 0; i < count; ++i) edge[i] = ink;
+            source = edge;
+          }
+          g_tft.setAddrWindow(x, y, count, 1);
+          g_tft.pushColors(source, count, true);
+        }
+        x += count;
+      }
+    }
+    g_tft.endWrite();
+    lv_disp_flush_ready(display);
+    return;
+  }
+#endif
   g_tft.startWrite();
   g_tft.setAddrWindow(area->x1, area->y1, width, height);
   g_tft.pushColors(reinterpret_cast<uint16_t*>(pixels), width * height, true);

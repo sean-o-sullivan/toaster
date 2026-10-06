@@ -383,12 +383,13 @@ void logRecipe(uint32_t now_ms) {
   const auto& phase = recipe->phases[g_recipe_log_phase];
   char line[200];
   const int length = snprintf(line, sizeof(line),
-      "RUNMETA,2,%u,%u,%u,%.9g,%.9g,%lu,%lu,%.9g,%.9g\n",
+      "RUNMETA,3,%u,%u,%u,%.9g,%.9g,%lu,%lu,%.9g,%.9g,%lu\n",
       static_cast<unsigned>(recipe->id), g_recipe_log_phase, static_cast<unsigned>(phase.kind),
       phase.target_celsius, phase.rate_celsius_per_second,
       static_cast<unsigned long>(phase.duration_seconds),
       static_cast<unsigned long>(recipe->maximum_run_seconds), recipe->maximum_process_celsius,
-      recipe->maximum_output_percent);
+      recipe->maximum_output_percent,
+      static_cast<unsigned long>(recipeHeatingDeadlineSeconds(*recipe)));
   if (logBounded(line, length, sizeof(line))) {
     ++g_recipe_log_phase;
     g_last_recipe_log_ms = now_ms;
@@ -434,6 +435,9 @@ void processUiCommand(uint32_t now_ms) {
       setHeaterGate(false);
       saveStudy();
       break;
+    case UiCommand::RecoverTuneCandidate:
+      g_engine.recoverTuneCandidate();
+      break;
     case UiCommand::CommissionProfile:
       g_validation.commission(g_ui.selectedRecipe() == RecipeId::CustomAnneal
           ? 2U : static_cast<uint8_t>(g_ui.selectedRecipe()), g_engine);
@@ -454,7 +458,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("Toaster thermal controller booting");
-  g_engine.configureControlChecks(1U, 1U, 1U);  // Fixed central PCB, initial 100 C scope.
+  // Fixed central PCB: 100/150/200 C checks approved.
+  g_engine.configureControlChecks(kControlCheck100Mask, kAllControlChecksMask, 1U);
   loadSettings();
   loadTuneReport();
   loadValidationReports();

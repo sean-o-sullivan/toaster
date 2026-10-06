@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-constexpr uint8_t kMinimumBrightnessPercent = 5;
+constexpr uint8_t kMinimumBrightnessPercent = 1;
 constexpr uint8_t kDefaultBrightnessPercent = 100;
 
 inline bool validBrightnessPercent(uint8_t value) {

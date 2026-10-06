@@ -8,6 +8,7 @@
 #include "display_settings.h"
 #include "profile_validation_state.h"
 #include "thermal_engine.h"
+#include "temperature_trend.h"
 
 enum class UiCommand : uint8_t {
   None,
@@ -20,6 +21,7 @@ enum class UiCommand : uint8_t {
   ChooseCheck200,
   ShowStudyResults,
   SaveStudy,
+  RecoverTuneCandidate,
   ChooseCommission100,
   ChooseCommission150,
   ChooseCommission200,
@@ -106,6 +108,7 @@ class OvenUi {
   uint32_t last_chart_ms_ = 0;
   uint32_t last_activity_ms_ = 0;
   EngineSnapshot snapshot_;
+  TemperatureTrend temperature_trend_;
   uint8_t confirm_reason_ = 0;
   uint8_t details_page_ = 0;
   bool details_from_fault_ = false;

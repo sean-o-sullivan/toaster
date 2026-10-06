@@ -17,7 +17,20 @@ enum TuneCheck : uint32_t {
   TuneAmplitudeSpread = 1U << 10,
   TuneMidpointSpread = 1U << 11,
   TuneInvalidGains = 1U << 12,
+  TuneInvalidMath = 1U << 13,
 };
+
+// Heuristic quality checks remain visible but do not block a usable estimate.
+constexpr uint32_t kTuneQualityChecks =
+    TunePeriodLow | TunePeriodHigh | TuneAmplitudeLow | TuneAmplitudeHigh |
+    TuneFractionLow | TuneFractionHigh | TuneMidpointOffset | TunePeriodSpread |
+    TuneAmplitudeSpread | TuneMidpointSpread;
+constexpr uint32_t kTuneBlockingChecks =
+    TuneSettling | TuneNeedWindow | TuneInvalidGains | TuneInvalidMath;
+
+inline uint32_t tuneBlockingFailures(uint32_t checks) {
+  return checks & kTuneBlockingChecks;
+}
 
 struct TuneCycleSample {
   uint8_t cycle = 0;
@@ -67,6 +80,7 @@ class RelayAutotune {
   static uint32_t candidateFailure(const PidGains& gains) {
     return validPidGains(gains) ? 0U : TuneInvalidGains;
   }
+  static bool estimateCandidate(const TuneCycleDiagnostics& diagnostic, PidGains& gains);
 
  private:
   uint32_t calculate(TuneCycleDiagnostics& diagnostic);

@@ -20,3 +20,7 @@
 *.mp4
 *.rgb565
 !/partitions.csv
+
+# Public README only
+!/.github/
+!/.github/README.md

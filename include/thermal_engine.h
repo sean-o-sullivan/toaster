@@ -151,11 +151,15 @@ struct PidStudy {
   uint32_t candidate_revision = 0;
 };
 
+uint8_t pidCandidateCheckedScope(const PidStudy& study);
+bool pidStudyChecksSatisfied(const PidStudy& study);
+
 bool isStudyRecipe(RecipeId id);
 int controlCheckIndex(RecipeId id);
 float controlCheckTargetCelsius(uint8_t index);
 
 const Recipe& recipeFor(RecipeId id);
+uint32_t recipeHeatingDeadlineSeconds(const Recipe& recipe);
 const char* toString(EngineState state);
 const char* toString(FaultCode fault);
 const char* toString(PhaseKind phase);
@@ -189,6 +193,7 @@ class ThermalEngine {
                uint32_t setup_revision);
   bool acceptStudy();
   bool loadTuneReport(const TuneRunReport& report);
+  bool recoverTuneCandidate();
   void saveFailed() { study_.save_failed = true; }
 
  private:
